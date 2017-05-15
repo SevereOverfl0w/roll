@@ -4,7 +4,8 @@
   (:require [cljs.nodejs :as nodejs]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
-            [cljs.spec :as s]))
+            [cljs.spec :as s]
+            [roll.modules.asg]))
 
 ;; The environment is used as a prefix to segregate all the named constructs in AWS
 (s/def ::environment string?)
@@ -173,52 +174,42 @@
   (when (= ::s/invalid (s/conform ::config config))
     (println (s/explain-data ::config config))
     (throw (ex-info "Invalid input" (s/explain-data ::config config))))
+  (println "here dom")
   {:provider {"aws" {:profile aws-profile
                      :region aws-region}}
    :module
    (into {}
          (concat
-          (for [{:keys [service version load-balancer] :as m} (:asgs config)]
-            (module [service version]
-                    (roll-module-src roll-home :asg)
-                    (-> config :services service
-                        (select-keys [:instance-count :instance-type :ami :key-name :availability-zones])
-                        (merge {:environment (str environment "-" (name service) "-" version)
-                                :security-group-id (ref-module-var [service "security"] "id")
-                                :iam-instance-profile (ref-module-var [service "security"] "iam_instance_profile")
-                                :user-data (render-template [service version "user_data"])}
-                               (when load-balancer
-                                 {:target_group_arns [(ref-module-var [load-balancer "alb_target"] "arn")]})))))
 
           ;; Create ALBs:
           (apply concat
                  (for [[balancer listeners] (:load-balancers config)
                        :let [listen-ports (map :listen listeners)]]
                    (concat
-                     (for [port listen-ports]
-                       (module [balancer (str port) "alb_security_group"]
-                               (roll-module-src roll-home :alb_security_group)
-                               {:name (name balancer)
-                                :environment environment
-                                :listen_port port}))
-                     [(module [balancer "alb_target"]
-                              (roll-module-src roll-home :alb_target)
+                    (for [port listen-ports]
+                      (module [balancer (str port) "alb_security_group"]
+                              (roll-module-src roll-home :alb_security_group)
                               {:name (name balancer)
                                :environment environment
-                               :security_groups (map #(ref-module-var [balancer (str %) "alb_security_group"] "id") listen-ports)
-                               :vpc_id (:vpc-id config)
-                               :subnet_ids (:subnets config)})]
-                     (map-indexed
-                       (fn [i {:keys [listen forward protocol ssl-policy certificate-arn]}]
-                         (module [balancer (str i) "alb_front"]
-                                 (roll-module-src roll-home :alb_front)
-                                 {:listen-port listen
-                                  :protocol protocol
-                                  :ssl-policy ssl-policy
-                                  :certificate-arn certificate-arn
-                                  :target_group_arn (ref-module-var [balancer "alb_target"] "arn")
-                                  :load_balancer_arn (ref-module-var [balancer "alb_target"] "load_balancer_arn")}))
-                       listeners))))
+                               :listen_port port}))
+                    [(module [balancer "alb_target"]
+                             (roll-module-src roll-home :alb_target)
+                             {:name (name balancer)
+                              :environment environment
+                              :security_groups (map #(ref-module-var [balancer (str %) "alb_security_group"] "id") listen-ports)
+                              :vpc_id (:vpc-id config)
+                              :subnet_ids (:subnets config)})]
+                    (map-indexed
+                     (fn [i {:keys [listen forward protocol ssl-policy certificate-arn]}]
+                       (module [balancer (str i) "alb_front"]
+                               (roll-module-src roll-home :alb_front)
+                               {:listen-port listen
+                                :protocol protocol
+                                :ssl-policy ssl-policy
+                                :certificate-arn certificate-arn
+                                :target_group_arn (ref-module-var [balancer "alb_target"] "arn")
+                                :load_balancer_arn (ref-module-var [balancer "alb_target"] "load_balancer_arn")}))
+                     listeners))))
 
           ;; Create Alias Resource Record Sets
           (for [{:keys [resource-name name-prefix zone-id load-balancer]} (:route-53-aliases config)
@@ -247,32 +238,18 @@
 
           ;; Create the encryption key allow each service to use it, including the bastion
           (when (:kms config)
-              (let [users (cons (ref-module-var ["bastion"] "role_arn")
-                                (for [service (keys (:services config))]
-                                  (ref-module-var [service "security"] "role_arn")))]
-                [(module ["kms-key"]
-                         (roll-module-src roll-home :kms)
-                         {:alias environment
-                          :root-arn (-> config :kms :root)
-                          :admin-arns (-> config :kms :admins)
-                          :user-arns users
-                          :attachment-arns users})]))))
+            (let [users (cons (ref-module-var ["bastion"] "role_arn")
+                              (for [service (keys (:services config))]
+                                (ref-module-var [service "security"] "role_arn")))]
+              [(module ["kms-key"]
+                       (roll-module-src roll-home :kms)
+                       {:alias environment
+                        :root-arn (-> config :kms :root)
+                        :admin-arns (-> config :kms :admins)
+                        :user-arns users
+                        :attachment-arns users})]))))
 
-   :resource
-   { ;;Every service we run needs access to S3 to fetch releases, plus additional policies:
-    :aws-iam-role-policy
-    (into {}
-          (for [[service {:keys [policies]}] (:services config)]
-            [(resolve-path [service])
-             {:name (str environment "-" (name service))
-              :role (ref-module-var [service "security"] "role_id")
-              :policy (->json
-                       {:Statement (concat [{:Effect "Allow"
-                                             :Action ["s3:GetObject"]
-                                             :Resource [(str "arn:aws:s3:::" releases-bucket "/*")]}]
-                                           policies)})}]))}
-
-   ;; Create run scripts for each service/version
+      ;; Create run scripts for each service/version
    :data
    {:template-file
     (into {}
@@ -281,9 +258,35 @@
              {:template (str "${file(\"" roll-home "/tf/files/run-server.sh\")}")
               :vars {:launch_command launch-command
                      :release_artifact release-artifact
-                     :releases_bucket releases-bucket}}]))}})
+                     :releases_bucket releases-bucket}}]))}
+
+   :resource
+   (apply merge-with merge
+          { ;;Every service we run needs access to S3 to fetch releases, plus additional policies:
+           :aws-iam-role-policy
+           (into {}
+                 (for [[service {:keys [policies]}] (:services config)]
+                   [(resolve-path [service])
+                    {:name (str environment "-" (name service))
+                     :role (ref-module-var [service "security"] "role_id")
+                     :policy (->json
+                              {:Statement (concat [{:Effect "Allow"
+                                                    :Action ["s3:GetObject"]
+                                                    :Resource [(str "arn:aws:s3:::" releases-bucket "/*")]}]
+                                                  policies)})}]))}
+
+          (for [{:keys [service version load-balancer] :as m} (take 1 (:asgs config))]
+            (roll.modules.asg/generate (-> config :services service
+                                           (select-keys [:instance-count :instance-type :ami :key-name :availability-zones])
+                                           (merge {:environment (str environment "-" (name service) "-" version)
+                                                   :security-group-id (ref-module-var [service "security"] "id")
+                                                   :iam-instance-profile (ref-module-var [service "security"] "iam_instance_profile")
+                                                   :user-data (render-template [service version "user_data"])}
+                                                  (when load-balancer
+                                                    {:target-group-arns [(ref-module-var [load-balancer "alb_target"] "arn")]}))))))})
 
 (def fs (nodejs/require "fs"))
+
 (def mustache (cljs.nodejs/require "mustache"))
 
 (defn render-mustache [template-file m]
