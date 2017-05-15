@@ -16,7 +16,7 @@
        :iam_instance_profile  iam-instance-profile
        :user_data             user-data
        :key_name              key-name
-       :lifecyle {:create_before_destroy  false}}}
+       :lifecycle {:create_before_destroy  false}}}
 
      :aws_autoscaling_group
      {environment
@@ -25,7 +25,7 @@
        :max_size              (str instance-count)
        :min_size              (str instance-count)
        :launch_configuration  (str "${aws_launch_configuration." (clojure.string/replace environment "-" "_") ".name}")
-       :target_group_arns     [target-group-arns]
+       :target_group_arns     target-group-arns
 
        :tag [{:key "Name"
               :value (str environment "-" (name app-name))
